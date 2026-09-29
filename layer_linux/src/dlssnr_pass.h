@@ -2,8 +2,8 @@
 // The composition pass, on the layer's dispatch table.
 //
 // This is OptiScaler's DlssNr_Vk with the loader-exported Vulkan calls replaced by the layer's next-
-// chain table; the SPIR-V is byte-for-byte the same module, so the picture this produces and the
-// picture OptiScaler produces are the same picture by construction rather than by agreement.
+// chain table. The build declares its storage images with an Unknown format for the actual
+// RGBA8/BGRA8/FP16 targets; all shader arithmetic remains unchanged.
 //
 // Three things are worth knowing before reading the implementation.
 //
@@ -33,15 +33,6 @@ class DlssNrPass : public Shader_Vk {
 
     VkDeviceSize _slotStride = 0;  // sizeof(DlssNrConstants), rounded up to the device's alignment
     uint32_t _slot = 0;            // next slot to hand out, wrapping
-
-    struct DescriptorState {
-        bool valid = false;
-        VkDeviceSize offset = 0;
-        VkImageView views[6]{};
-        VkImageLayout sourceLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VkImageLayout motionLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    };
-    DescriptorState _descriptorState[kSlots]{};
 
     // Stands in for a resource a given mode does not read. One pixel, never sampled for its content,
     // present only because Vulkan will not accept an unwritten binding.

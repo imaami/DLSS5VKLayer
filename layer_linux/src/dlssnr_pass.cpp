@@ -34,7 +34,7 @@ DlssNrPass::DlssNrPass(const DeviceTable* InVk, const InstanceTable* InInstance,
     _slotStride = ((sizeof(DlssNrConstants) + alignment - 1) / alignment) * alignment;
 
     if (!CreateBufferResource(&_constantBuffer, &_constantBufferMemory, _slotStride * kSlots,
-                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                              VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         Log("[pass] could not allocate the constant ring");
         return;
@@ -166,26 +166,6 @@ bool DlssNrPass::CreateDummy(VkCommandBuffer cmdList) {
 void DlssNrPass::WriteDescriptors(VkDescriptorSet set, VkDeviceSize constantOffset, VkImageView source,
                                   VkImageView model, VkImageView original, VkImageView motion, VkImageView target,
                                   VkImageView keep, VkImageLayout sourceLayout, VkImageLayout motionLayout) {
-    const VkImageView boundViews[] = {
-        source != VK_NULL_HANDLE ? source : _dummyView,
-        model != VK_NULL_HANDLE ? model : _dummyView,
-        original != VK_NULL_HANDLE ? original : _dummyView,
-        motion != VK_NULL_HANDLE ? motion : _dummyView,
-        target != VK_NULL_HANDLE ? target : _dummyView,
-        keep != VK_NULL_HANDLE ? keep : _dummyView,
-    };
-    const uint32_t slot = uint32_t(set == VK_NULL_HANDLE ? 0 : (_slot + kSlots - 1) % kSlots);
-    DescriptorState& state = _descriptorState[slot];
-    bool same = state.valid && state.offset == constantOffset &&
-                state.sourceLayout == sourceLayout && state.motionLayout == motionLayout;
-    for (uint32_t i = 0; same && i < 6; ++i) same = state.views[i] == boundViews[i];
-    if (same) return;
-    state.valid = true;
-    state.offset = constantOffset;
-    state.sourceLayout = sourceLayout;
-    state.motionLayout = motionLayout;
-    for (uint32_t i = 0; i < 6; ++i) state.views[i] = boundViews[i];
-
     VkDescriptorBufferInfo bufferInfo { _constantBuffer, constantOffset, sizeof(DlssNrConstants) };
 
     const auto readInfo = [&](VkImageView v, VkImageLayout layout) {

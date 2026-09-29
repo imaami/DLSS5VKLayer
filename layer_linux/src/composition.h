@@ -5,8 +5,9 @@
 // only thing available is a finished swapchain image, and the model lives in another process behind a
 // shared-memory round trip, so the same pass has to be split in two around that round trip:
 //
-//   leg 1   swapchain -> frame -> ENCODE -> proxy (+ the untouched keep)
-//                              -> DOWNSAMPLE -> work, when the model runs below the frame
+//   leg 1   swapchain -> frame -> ENCODE -> proxy, unless a display-referred UNORM frame is its own
+//                              -> DOWNSAMPLE -> work, when the model runs below the frame or
+//                                 reads the frame directly
 //                              -> host buffer
 //     ...   the helper runs the model on those pixels and answers
 //   leg 2   host buffer -> model image -> RESOLVE -> composed -> swapchain
@@ -33,6 +34,7 @@ namespace dlssnr {
 // One frame's worth of settings, read from the shared header once so that a control changed
 // mid-frame cannot make the encode and the resolve disagree about what they are doing.
 struct FrameSettings {
+    uint32_t controlSeq = 0, tuningSeq = 0, passes = 0;
     float transferStrength = 1.0f;
     float colourStrength = 1.0f;
     float maxRatio = 2.0f;
@@ -48,6 +50,8 @@ struct FrameSettings {
     float compareSplit = 0.5f;
     float compareZoom = 1.0f;
     float workingScale = 1.0f;
+    uint32_t nativeModelMaxWidth = 0;
+    uint32_t nativeModelMaxHeight = 0;
     uint32_t transfer = 1;
     uint32_t debugView = 0;
     uint32_t compareMode = 0;
@@ -111,6 +115,9 @@ class Composition {
     // the encode writes normalised linear light instead of an sRGB picture. hdrTransfer = 1 says the
     // swapchain itself carries PQ. Both are honoured only while the device can hold a float16 proxy;
     // Prepare reports the decision it actually made through HdrProxyActive().
+    // Native HIP is the exception: its network cannot consume the NGX linear-light
+    // float proxy, so the proxy stays sRGB-encoded at either precision and
+    // hdrTransfer is honoured with an RGBA8 proxy too.
     bool Prepare(uint32_t width, uint32_t height, VkFormat swapchainFormat, const FrameSettings& s,
                  bool linearHdr, bool hdrProxy = false, uint32_t hdrTransfer = 0);
 
@@ -133,12 +140,39 @@ class Composition {
     // only between frames (the caller must have waited for the previous frame's work).
     void SetTransport(void* inRegion, void* outRegion, size_t bytes);
 
+    // Native HIP: build the transport pair as exportable device-local memory the worker imports,
+    // so the proxy and the answer never leave VRAM. family is the queue family both legs run on.
+    void EnableExport(uint32_t family) { _export = true; _exportFamily = family; }
+    // The pair is exported memory the worker has not acknowledged: no frame may use it before
+    // an offer succeeds (ExportTransport, SetTransportReady) or DisableExport replaces it.
+    bool TransportPending() const { return _download.allocation && !_transportReady; }
+    // The acknowledged generation requests name, or zero for the host transport.
+    uint32_t TransportGeneration() const { return _transportReady ? _transportGen : 0; }
+    // The connection an offer of the pair awaits the daemon's answer on, or -1 (AwaitAnswer,
+    // WithdrawOffer). The composition closes it.
+    int OfferConnection() const { return _offer; }
+    void AwaitAnswer(int connection) { WithdrawOffer(); _offer = connection; }
+    void WithdrawOffer();
+    // True when the daemon imported the pair; false when it holds none, so the pair is offered
+    // again. Either ends an outstanding offer.
+    void SetTransportReady(bool ready) { _transportReady = ready; WithdrawOffer(); }
+    // Two new descriptors for the proxy and answer memory, which the caller owns, and the rest of
+    // their offer, under a fresh generation number.
+    bool ExportTransport(int fds[2], ShmTransportOffer& offer);
+    // The worker cannot import the pair: carry frames through host staging from now on.
+    void DisableExport();
+
     // Leg 1. Leaves the proxy the model should see in the download buffer, and the swapchain image
     // back in PRESENT_SRC_KHR so a caller that gives up after this still presents something valid.
     bool RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, const FrameSettings& s);
 
     // The pixels leg 1 produced, and where the model's answer goes before leg 2.
     const void* ProxyPixels() const { return _download.mapped; }
+    // The transfer pair, for a network recorded on this device: capture writes the proxy and
+    // compose reads the answer. Exported, both belong to VK_QUEUE_FAMILY_EXTERNAL between uses.
+    VkBuffer ProxyBuffer() const { return _download.buffer; }
+    VkBuffer AnswerBuffer() const { return _upload.buffer; }
+    bool TransportExported() const { return _download.allocation && _upload.allocation; }
     void* ModelPixels() { return _upload.mapped; }
 
     // Leg 2. Composes and leaves the swapchain image holding the result, in PRESENT_SRC_KHR.
@@ -198,8 +232,11 @@ class Composition {
     void MarkModelFrame() { _haveModel = true; }
 
     // Write this many matched before/after pairs, starting with the next composed frame.
-    void RequestCapture(uint32_t frames) { _capture.Begin(frames); }
+    void RequestCapture(uint32_t frames, uint32_t controlSeq) { _capture.Begin(frames, controlSeq); }
+    void SetCaptureInference(uint32_t seq) { _captureMetadata.inferenceSeq = seq; }
     bool CaptureActive() const { return _capture.Active(); }
+    // This frame's compose recorded a pair; an active capture without its host buffer records none.
+    bool CaptureRecorded() const { return _captureRecorded; }
 
     // Called after leg 2's fence, when the readback the compose recorded has landed.
     void WriteCapturedFrame();
@@ -229,6 +266,8 @@ class Composition {
         // Non-null when the allocation is the shared-memory region itself (an imported host
         // pointer), rather than private pinned memory the transport is copied through.
         void* hostPtr = nullptr;
+        // Nonzero, the allocation size, when the buffer is exported device-local memory.
+        VkDeviceSize allocation = 0;
     };
 
     bool MakeImage(Image& img, uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage);
@@ -236,6 +275,9 @@ class Composition {
     bool ImportFdMemory(int fd, VkImage image, const VkMemoryRequirements& req, VkDeviceMemory* out);
     bool MakeHostBuffer(HostBuffer& buf, size_t bytes, VkBufferUsageFlags usage);
     bool MakeTransportBuffer(HostBuffer& buf, size_t bytes, VkBufferUsageFlags usage, void* hostPtr);
+    bool MakeExportBuffer(HostBuffer& buf, size_t bytes);
+    void ExternalOwnership(VkCommandBuffer cb, const HostBuffer& buf, uint32_t from, uint32_t to,
+                           VkAccessFlags access);
     void DropHostBuffer(HostBuffer& buf);
     void EnsureTransport();
     void DropAll();
@@ -270,13 +312,12 @@ class Composition {
     VkFormat _swapchainFormat = VK_FORMAT_UNDEFINED;
     VkFormat _workFormat = VK_FORMAT_UNDEFINED;  // usually the swapchain's UNORM twin; see Prepare
     bool _blitSwapchain = false;                 // set when _workFormat is not the swapchain's twin
-    VkFormat _keepFormat = VK_FORMAT_UNDEFINED;
     bool _linearHdr = false;
     bool _hdrProxy = false;
     uint32_t _hdrTransfer = 0;
     bool _haveModel = false;
 
-    Image _frame{}, _keep{}, _proxy{}, _work{}, _model{}, _composed{};
+    Image _frame{}, _proxy{}, _work{}, _model{}, _composed{};
 
     // Supersampling: the model works above the frame, so the proxy is enlarged on the way in and the
     // answer averaged back on the way out. _modelNative holds that average; without it the resolve
@@ -287,7 +328,7 @@ class Composition {
     bool _superSample = false;
     uint32_t _scalerFilter = kScalerLanczos3;
 
-    // The white point meter: a grid of tile peak luminances measured off the untouched copy, and the
+    // The white point meter: a grid of tile peak luminances measured off the captured frame, and the
     // percentile taken across it -- on the GPU. The reduce pass keeps the percentile, the history
     // and the resolved value in a device-local state buffer; the resolve reads the resolved value
     // through a four-byte copy into its own constant block, so no tensor crosses to the host. The
@@ -313,6 +354,12 @@ class Composition {
     void* _transportIn = nullptr;
     void* _transportOut = nullptr;
     size_t _transportBytes = 0;
+    // The exported native transport (EnableExport).
+    bool _export = false;
+    bool _transportReady = false;
+    int _offer = -1;
+    uint32_t _exportFamily = 0;
+    uint32_t _transportGen = 0;
 
     // Phase 5. _proxyXfer is the proxy at the model's raster in exportable device memory;
     // _answerXfer is the helper's answer, imported from its dma-buf. Both are null when the
@@ -322,10 +369,11 @@ class Composition {
     bool _answerViaFd = false;
 
     CaptureWriter _capture;
+    CaptureMetadata _captureMetadata{};
     bool _captureRecorded = false;
 
-    // Frame hold. The freeze point is the raw colour the encode reads, not the proxy: both the proxy
-    // and the untouched keep are derived from it, and freezing further down would stop a setting
+    // Frame hold. The freeze point is the raw colour the encode reads, not the proxy: the proxy is
+    // derived from it and the resolve reads it, and freezing further down would stop a setting
     // change from re-encoding, which is the whole point of holding.
     bool _holding = false;
     bool _frameCaptured = false;

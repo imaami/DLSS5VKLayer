@@ -29,9 +29,9 @@ cbuffer Params : register(b0)
     uint  gApplyModel;     // 0 output the clean frame (pass still runs), 1 apply the model's edit
     uint  gUseGameExposure;// D3D12 source-1 only: 1 = read the game's live exposure in-shader (t4)
     float gExposurePreMul; // preExposure * trim, so the live white point is gExposurePreMul / exposure
-    uint  gHdrProxy;       // 1: the proxy surface is float16 carrying linear HDR normalised by the
+    uint  gHdrProxy;       // 2: native encoded FP16; 1: the proxy surface is float16 carrying linear HDR normalised by the
                            //    white point -- no knee, no sRGB, no ceiling. Off is the SDR path.
-    uint  gHdrTransfer;    // 1 with gHdrProxy: the swapchain carries PQ (ST 2084), so the frame is
+    uint  gHdrTransfer;    // 1: the swapchain carries PQ (ST 2084), so the frame is
                            //    PQ-decoded on the way in and PQ-encoded on the way out.
     float gColourTrust;    // maximum chroma displacement from the frame, in normalized units
     float gRatioSmooth;    // how much of the relighting ratio to take from the neighbourhood
@@ -303,16 +303,34 @@ static const float kPqC3 = 18.6875;           // 2392 / 4096 * 32
 // this is the divisor that puts a UI white at 1.0. The user's white point scales it from there.
 static const float kPqPaperWhite = 0.0203;
 
-float3 PqToLinear(float3 pq)
+float3 PqToLinear2020(float3 pq)
 {
     float3 q = pow(max(pq, 0.0), 1.0 / kPqM2);
-    return pow(max(q - kPqC1, 0.0) / (kPqC2 - kPqC3 * q), 1.0 / kPqM1);
+    return pow(max(q - kPqC1, 0.0) / max(kPqC2 - kPqC3 * q, 1e-6), 1.0 / kPqM1);
+}
+
+float3 Linear2020ToPq(float3 linear2020)
+{
+    float3 q = pow(max(linear2020, 0.0), kPqM1);
+    return pow((kPqC1 + kPqC2 * q) / (1.0 + kPqC3 * q), kPqM2);
+}
+
+float3 PqToLinear(float3 pq)
+{
+    float3 linear2020 = PqToLinear2020(pq);
+    // HDR10 is BT.2020; the neural codec and composition operate in BT.709.
+    const float3x3 to709 = { 1.660491002108, -0.587641138789, -0.072849863320,
+                           -0.124550474522, 1.132899897126, -0.008349422604,
+                           -0.018150763355, -0.100578898008, 1.118729661363 };
+    return mul(to709, linear2020);
 }
 
 float3 LinearToPq(float3 lin)
 {
-    float3 q = pow(max(lin, 0.0), kPqM1);
-    return pow((kPqC1 + kPqC2 * q) / (1.0 + kPqC3 * q), kPqM2);
+    const float3x3 to2020 = { 0.627403895935, 0.329283038378, 0.043313065687,
+                            0.069097289358, 0.919540395075, 0.011362315566,
+                            0.016391438875, 0.088013307877, 0.895595253248 };
+    return Linear2020ToPq(mul(to2020, lin));
 }
 
 // The white point in the composition's normalised units -- 1.0 is paper white whatever the frame's
@@ -321,8 +339,8 @@ float3 LinearToPq(float3 lin)
 // as a multiplier on that.
 float NormScale()
 {
-    if (gHdrProxy != 0)
-        return max(gWhitePoint, 1e-4) * (gHdrTransfer != 0 ? kPqPaperWhite : 1.0);
+    if (gHdrTransfer != 0)
+        return max(gWhitePoint, 1e-4) * kPqPaperWhite;
     return gPassthrough != 0 ? 1.0 : max(gWhitePoint, 1e-4);
 }
 
@@ -501,7 +519,7 @@ float3 CubeScaleResidual(float3 P, float3 T)
 {
     // The unit cube is the SDR proxy's bound. A float16 proxy is unbounded by design -- the edit may
     // take a pixel past 1.0 into real HDR and that is the picture, not an overflow.
-    if (gPassthrough != 0 || gHdrProxy != 0)
+    if (gPassthrough != 0 || gHdrProxy == 1)
         return T;
 
     float3 d = T - P;
@@ -580,8 +598,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             for (uint tx = tx0; tx < max(tx1, tx0 + 1u); tx += stepX)
             {
                 float3 c = max(gSource.Load(int3(min(tx, fullW - 1u), min(ty, fullH - 1u), 0)).rgb, 0.0);
-                if (gHdrProxy != 0 && gHdrTransfer != 0)
-                    c = PqToLinear(c);  // a PQ peak is a code, not a luminance; the divisor is in nits
+                if (gHdrTransfer != 0)
+                    c = PqToLinear(c) / kPqPaperWhite;  // meter reports multiples of 203-nit paper white
                 peak = max(peak, dot(c, kLuma));
             }
         }
@@ -627,8 +645,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             for (uint tx = tx0; tx < max(tx1, tx0 + 1u); tx += stepX)
             {
                 float3 c = max(gSource.Load(int3(min(tx, fullW - 1u), min(ty, fullH - 1u), 0)).rgb, 0.0);
-                if (gHdrProxy != 0 && gHdrTransfer != 0)
-                    c = PqToLinear(c);  // see the calibrate mode: the meter must measure light, not code
+                if (gHdrTransfer != 0)
+                    c = PqToLinear(c) / kPqPaperWhite;  // same units as the white-point controls
                 sum += dot(c, kLuma);
                 taken++;
             }
@@ -703,14 +721,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         float4 source = gSource.Load(int3(id.xy, 0));
         float3 frame = max(source.rgb, float3(0.0, 0.0, 0.0));
 
-        // Kept so the resolve has the frame as it was, rather than having to reconstruct it.
-        gKeep[id.xy] = float4(frame, source.a);
-
         // The float16 proxy. The frame's light -- PQ-decoded first if the swapchain carries PQ --
         // divided by the white point, and that is all: no knee, no sRGB, no ceiling. The whole point
         // of the float proxy is that the model is shown the highlights the SDR encode throws away,
         // so anything that compresses the range here would undo it. The resolve undoes the divide.
-        if (gHdrProxy != 0)
+        if (gHdrProxy == 1)
         {
             float3 lin = gHdrTransfer != 0 ? PqToLinear(frame) : frame;
             gTarget[id.xy] = float4(lin / NormScale(), source.a);
@@ -741,7 +756,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // that shows the model highlight gradation the knee throws away. Reached only when the frame
         // is not passthrough (handled and returned above), so NeutwoEncode never sees a tone-mapped
         // frame. Both are undone by the resolve: the knee approximately, Neutwo exactly.
-        float3 normalized = frame / WhitePoint();
+        // Native HIP's HDR proxy remains display encoded; only its storage
+        // changes to FP16. PQ decoding must therefore also work outside NGX's
+        // raw-linear float-proxy branch above.
+        float3 normalized = (gHdrTransfer != 0 ? PqToLinear(frame) : frame) / NormScale();
         float3 display;
         if (gReversibleMode == 0)
             display = SoftKnee(normalized);        // soft knee
@@ -803,7 +821,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Nothing was encoded on the way in, so nothing is decoded here either. The float16 proxy is
     // linear light already -- the sRGB decode would fold the highlights flat.
     float3 proxy, model;
-    if (gHdrProxy != 0 || gPassthrough != 0)
+    if (gHdrProxy == 1 || gPassthrough != 0)
     {
         proxy = proxySample.rgb;
         model = modelSample.rgb;
@@ -843,7 +861,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             const float2 uvn = saturate(cmpUv + off);
             float3 pn = gSource.SampleLevel(gLinear, uvn, 0).rgb;
             float3 mn = gModel.SampleLevel(gLinear, uvn, 0).rgb;
-            if (gHdrProxy == 0 && gPassthrough == 0)
+            if (gHdrProxy != 1 && gPassthrough == 0)
             {
                 pn = SrgbToLinear(pn);
                 mn = SrgbToLinear(mn);
@@ -866,7 +884,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // own hue, which is what makes the failure so confusing to look at.
     const float normScale = NormScale();
     float3 originalRaw = originalSample.rgb;
-    if (gHdrProxy != 0 && gHdrTransfer != 0)
+    if (gHdrTransfer != 0)
         originalRaw = PqToLinear(max(originalRaw, 0.0));  // the frame's own light, in nits
     float3 original = originalRaw / normScale;
 
@@ -878,22 +896,22 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // with and without Neural Rendering. In passthrough the frame is already display-referred.
     if (gApplyModel == 0)
     {
-        gTarget[id.xy] = float4(max(originalSample.rgb, 0.0), originalSample.a);
+        gTarget[id.xy] = originalSample;
         return;
     }
 
     if (gDebugView == 1)
     {
-        float3 dbg = proxy * gDebugScale * (gHdrProxy != 0 ? normScale : 1.0);
-        if (gHdrProxy != 0 && gHdrTransfer != 0) dbg = LinearToPq(dbg);
+        float3 dbg = proxy * gDebugScale * normScale;
+        if (gHdrTransfer != 0) dbg = LinearToPq(dbg);
         gTarget[id.xy] = float4(dbg, originalSample.a);
         return;
     }
 
     if (gDebugView == 2)
     {
-        float3 dbg = model * gDebugScale * (gHdrProxy != 0 ? normScale : 1.0);
-        if (gHdrProxy != 0 && gHdrTransfer != 0) dbg = LinearToPq(dbg);
+        float3 dbg = model * gDebugScale * normScale;
+        if (gHdrTransfer != 0) dbg = LinearToPq(dbg);
         gTarget[id.xy] = float4(dbg, originalSample.a);
         return;
     }
@@ -907,8 +925,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     {
         // Amplified and centred on grey, so both directions of the edit are visible at once.
         float3 shown = saturate(0.5 + edit * 20.0);
-        float3 dbg = SrgbToLinear(shown) * gDebugScale * (gHdrProxy != 0 ? normScale : 1.0);
-        if (gHdrProxy != 0 && gHdrTransfer != 0) dbg = LinearToPq(dbg);
+        float3 dbg = SrgbToLinear(shown) * gDebugScale * normScale;
+        if (gHdrTransfer != 0) dbg = LinearToPq(dbg);
         gTarget[id.xy] = float4(dbg, originalSample.a);
         return;
     }
@@ -973,7 +991,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // same passthrough check the encode has. Without this, a reversible + matched-residual +
         // already-tone-mapped frame would Neutwo-compress a frame the encode left raw. Neutwo already
         // lands in [0,1), so it needs no saturate.
-        float3 fullProxy = gHdrProxy != 0
+        float3 fullProxy = gHdrProxy == 1
                                ? original  // the float encode is a divide; the rebuild is the same divide
                                : gPassthrough != 0
                                ? saturate(original)
@@ -1026,7 +1044,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // Saturated like the blend in the branch below. Detail strength above 1 is carried further
         // down as a power on the luminance ratio, so scaling the edit by it here as well spends it
         // twice.
-        upgraded = max(original + edit * saturate(gTransferStrength), float3(0.0, 0.0, 0.0));
+        // A wide-gamut original keeps its own negative BT.709 coordinates; the edit adds none. Not
+        // on HdrProxy 1: nothing below falls back to the frame's hue for its wide-gamut pixels, and
+        // kept negatives would outweigh darkened positive channels in the output. Zero, as upstream.
+        upgraded = max(original + edit * saturate(gTransferStrength),
+                       gHdrProxy == 1 ? 0.0 : min(original, 0.0));
 
         // What bounds the sum. An addition says nothing about where the result lands, so the model's
         // verdict is read as a ratio on the pair it came from and the sum is held near it.
@@ -1342,15 +1364,17 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (gDebugView == 4)
     {
         const float a = saturate(colourAllow);
-        gTarget[id.xy] = float4(float3(1.0 - a, a, 0.0) * WhitePoint(), originalSample.a);
+        float3 dbg = float3(1.0 - a, a, 0.0) * normScale;
+        if (gHdrTransfer != 0) dbg = LinearToPq(dbg);
+        gTarget[id.xy] = float4(dbg, originalSample.a);
         return;
     }
 
     // The composed colour before the bound is applied, so the two can be compared frame by frame.
     if (gDebugView == 5)
     {
-        float3 dbg = upgraded * gDebugScale * (gHdrProxy != 0 ? normScale : 1.0);
-        if (gHdrProxy != 0 && gHdrTransfer != 0) dbg = LinearToPq(dbg);
+        float3 dbg = upgraded * gDebugScale * normScale;
+        if (gHdrTransfer != 0) dbg = LinearToPq(dbg);
         gTarget[id.xy] = float4(max(dbg, 0.0), originalSample.a);
         return;
     }
@@ -1362,21 +1386,32 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));
 
+    // The HIP model sees an SDR/BT.709 proxy, which cannot hold a wide-gamut source's negative
+    // BT.709 coordinates: keep their native hue and transfer luminance only, or even an identity
+    // model desaturates BT.2020 primaries. The replace modes take the model's answer instead.
+    const bool nativeWideGamut = gPassthrough == 0 && gHdrProxy != 1 && gReversibleMode != 2 &&
+                                 gReversibleMode != 4 && any(original < 0.0);
+    if (nativeWideGamut)
+        result = lumaOnly;
+
     // Replace mode: the model's answer IS the picture, decoded through Neutwo's exact inverse, with
     // NONE of the composition above -- no ratio, no highlight guard, no palette blend. This is the
     // RenoDX reversible-bridge behaviour and the second half of the A/B: composed vs pure model. On a
     // passthrough frame the model already worked in the frame's own space, so it is taken directly.
     if (gReversibleMode == 2)
-        result = (gPassthrough != 0 || gHdrProxy != 0) ? modelDirect : NeutwoDecode(modelDirect);
+        result = (gPassthrough != 0 || gHdrProxy == 1) ? modelDirect : NeutwoDecode(modelDirect);
     else if (gReversibleMode == 4)
-        result = (gPassthrough != 0 || gHdrProxy != 0) ? modelDirect : HybridDecode(modelDirect);
+        result = (gPassthrough != 0 || gHdrProxy == 1) ? modelDirect : HybridDecode(modelDirect);
 
     // Back out of the normalised space the composition worked in, and back into the swapchain's own
     // transfer. A PQ frame's code is not linear light; writing the composition's linear answer
     // straight to it would darken the whole picture into the bottom of the curve.
     result *= normScale;
-    if (gHdrProxy != 0 && gHdrTransfer != 0)
-        result = LinearToPq(max(result, 0.0));
+    // A luminance-only edit applies in the source gamut directly: inverse FP32 matrices leave a
+    // saturated primary tiny nonzero channels, which PQ amplifies visibly near black.
+    if (gHdrTransfer != 0)
+        result = nativeWideGamut ? Linear2020ToPq(PqToLinear2020(originalSample.rgb) * boundedRatio)
+                                 : LinearToPq(result);
 
     // The side being shown untouched takes the frame as it arrived, past every step above -- code
     // for code, transfer included.
@@ -1392,11 +1427,15 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (onDivider)
     {
         float3 white = float3(WhitePoint(), WhitePoint(), WhitePoint());
-        if (gHdrProxy != 0 && gHdrTransfer != 0)
+        if (gHdrTransfer != 0)
             white = LinearToPq(float3(WhitePoint() * kPqPaperWhite, WhitePoint() * kPqPaperWhite,
                                       WhitePoint() * kPqPaperWhite));
         result = white;
     }
 
-    gTarget[id.xy] = float4(max(result, float3(0.0, 0.0, 0.0)), originalSample.a);
+    // A linear scRGB target supports negative coordinates for colors outside
+    // BT.709. UNORM/PQ destinations remain bounded by their own color encoding.
+    float3 stored = gPassthrough == 0 && gHdrTransfer == 0
+        ? result : max(result, float3(0.0, 0.0, 0.0));
+    gTarget[id.xy] = float4(stored, originalSample.a);
 }

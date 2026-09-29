@@ -19,9 +19,11 @@ namespace dlssnr {
     X(vkDestroyInstance)                                                                           \
     X(vkEnumeratePhysicalDevices)                                                                  \
     X(vkGetPhysicalDeviceProperties)                                                               \
+    X(vkGetPhysicalDeviceFeatures)                                                                 \
     X(vkGetPhysicalDeviceMemoryProperties)                                                         \
     X(vkGetPhysicalDeviceFormatProperties)                                                         \
     X(vkGetPhysicalDeviceQueueFamilyProperties)                                                    \
+    X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)                                                   \
     X(vkEnumerateDeviceExtensionProperties)                                                        \
     X(vkGetPhysicalDeviceMemoryProperties2)                                                        \
     X(vkGetPhysicalDeviceProperties2)

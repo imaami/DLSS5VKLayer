@@ -190,7 +190,9 @@ struct alignas(256) DlssNrConstants
     // without the sRGB decode. HdrTransfer = 1 says the swapchain itself carries PQ, so the frame is
     // PQ-decoded on the way in and PQ-encoded on the way out. Both zero keeps the SDR path
     // byte-identical. Trailing, mirroring the cbuffer.
+    // 2 selects native HIP encoded FP16: same color domain as RGBA8, finer precision.
     uint32_t HdrProxy;
+    // Native HIP also uses this PQ conversion with its display-encoded proxy.
     uint32_t HdrTransfer;
 
     // How much of the chroma-agreement gate to apply, 0..1. See colourTrustPercent.
