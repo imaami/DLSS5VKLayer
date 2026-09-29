@@ -1,5 +1,5 @@
 // Native Linux controls. Shared-memory offsets and defaults come from the protocol.
-#include "../../common/control_settings.h"
+#include "control_settings.h"
 
 #include <cerrno>
 #include <cctype>
