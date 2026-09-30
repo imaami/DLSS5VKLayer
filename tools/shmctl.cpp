@@ -103,7 +103,7 @@ void Usage() {
         "--hdr-mode changes proxy precision; forcing 16-bit does not reinterpret SDR as HDR.\n"
         "HDR normalization follows --color-mode even with an 8-bit proxy.\n"
         "Motion estimates come from the presented frames, not engine motion vectors.\n"
-        "--tier rebuilds the worker's network for another raster, which takes seconds;\n"
+        "--tier rebuilds the daemon's network for another raster, which takes under a second;\n"
         "the game presents its own frames meanwhile. Setting the active tier does nothing.\n"
         "Composition controls apply to the Vulkan composition path; --cpu-compose\n"
         "uses the worker's own composition. Layer environment overrides take precedence\n"
