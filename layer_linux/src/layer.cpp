@@ -1871,21 +1871,27 @@ static bool ProcessInLayer(DeviceChain* dc, SwapchainState& sc, VkQueue queue, u
         return false;
     }
     // Past the capture, a failure submits what was recorded, as leg 1 alone would be: the
-    // composition's state moved with it, and the image is back in PRESENT_SRC_KHR.
-    const auto salvage = [&] {
-        if (SubmitLeg(dc, queue, si, sc.fenceLeg1, waitsConsumed)) WaitLeg(dc, sc.fenceLeg1);
+    // composition's state moved with it, and the image is back in PRESENT_SRC_KHR. With NETWORK,
+    // the network's frame is among what was recorded, and the network is told it was submitted.
+    const auto salvage = [&](bool network) {
+        if (SubmitLeg(dc, queue, si, sc.fenceLeg1, waitsConsumed)) {
+            if (network) g_network.submitted(dc->inLayer);
+            WaitLeg(dc, sc.fenceLeg1);
+        }
         return false;
     };
     if (g_network.record(dc->inLayer, cb, sc.comp->ProxyBuffer(), sc.comp->AnswerBuffer(), sc.family,
                          sc.comp->TransportExported()) != kDlsslopNetworkReady) {
         NetworkFailed(dc);
-        return salvage();
+        return salvage(false);
     }
     sc.comp->MarkModelFrame();
-    if (!sc.comp->RecordCompose(cb, sc.images[index], fs)) return salvage();
+    if (!sc.comp->RecordCompose(cb, sc.images[index], fs)) return salvage(true);
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &sc.leg2Done[index];
     if (!SubmitLeg(dc, queue, si, sc.fenceLeg2, waitsConsumed)) return false;
+    // The network's motion history takes in only the frames that reached the queue.
+    g_network.submitted(dc->inLayer);
     sc.leg2Pending = true;
     if (sc.comp->CaptureRecorded()) CollectLeg2(dc, sc);
     PublishFrame(dc, sc, NowMs() - t0);
